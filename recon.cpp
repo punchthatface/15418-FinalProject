@@ -19,9 +19,7 @@ void subsampleFrame(const cv::Mat& input,
     }
 }
 
-#include <algorithm> // for std::clamp
-
-static cv::Vec3b bilinearPredict(const cv::Mat& subsampled,
+cv::Vec3b bilinearPredict(const cv::Mat& subsampled,
                                  const cv::Mat& mask,
                                  int y, int x,
                                  int factor)
@@ -183,4 +181,116 @@ void iterativeRefine(cv::Mat& img,
     }
 
     img = cur; // Final refined image
+}
+
+void classifyTilesSADSubsample(const cv::Mat& currSubsampled,
+                               const cv::Mat& prevSubsampled,
+                               int tileSize,
+                               double sadThreshold,
+                               cv::Mat& tileActiveMask)
+{
+    // If no previous subsampled frame, mark everything active
+    if (prevSubsampled.empty()) {
+        int tilesY = (currSubsampled.rows + tileSize - 1) / tileSize;
+        int tilesX = (currSubsampled.cols + tileSize - 1) / tileSize;
+        tileActiveMask = cv::Mat::ones(tilesY, tilesX, CV_8UC1);
+        return;
+    }
+
+    CV_Assert(currSubsampled.size() == prevSubsampled.size());
+    CV_Assert(currSubsampled.type() == prevSubsampled.type());
+    CV_Assert(currSubsampled.type() == CV_8UC3);
+
+    int rows = currSubsampled.rows;
+    int cols = currSubsampled.cols;
+
+    int tilesY = (rows + tileSize - 1) / tileSize;
+    int tilesX = (cols + tileSize - 1) / tileSize;
+
+    tileActiveMask = cv::Mat::zeros(tilesY, tilesX, CV_8UC1);
+
+    for (int ty = 0; ty < tilesY; ++ty) {
+        for (int tx = 0; tx < tilesX; ++tx) {
+            int y0 = ty * tileSize;
+            int x0 = tx * tileSize;
+            int y1 = std::min(y0 + tileSize, rows);
+            int x1 = std::min(x0 + tileSize, cols);
+
+            double sad = 0.0;
+            int pixelCount = 0;
+
+            for (int y = y0; y < y1; ++y) {
+                const cv::Vec3b* pc = currSubsampled.ptr<cv::Vec3b>(y);
+                const cv::Vec3b* pp = prevSubsampled.ptr<cv::Vec3b>(y);
+                for (int x = x0; x < x1; ++x) {
+                    cv::Vec3b c = pc[x];
+                    cv::Vec3b p = pp[x];
+                    sad += std::abs((int)c[0] - (int)p[0]);
+                    sad += std::abs((int)c[1] - (int)p[1]);
+                    sad += std::abs((int)c[2] - (int)p[2]);
+                    pixelCount++;
+                }
+            }
+
+            if (pixelCount == 0) {
+                tileActiveMask.at<uint8_t>(ty, tx) = 1; // edge case: treat as active
+                continue;
+            }
+
+            double avgSAD = sad / (pixelCount * 3.0);
+
+            tileActiveMask.at<uint8_t>(ty, tx) =
+                (avgSAD > sadThreshold) ? 1 : 0;
+        }
+    }
+}
+
+void iterativeRefineTiles(cv::Mat& img,
+                          const cv::Mat& mask,
+                          const cv::Mat& tileActiveMask,
+                          int tileSize,
+                          int iterations)
+{
+    CV_Assert(img.size() == mask.size());
+    CV_Assert(mask.type() == CV_8UC1);
+    CV_Assert(img.type() == CV_8UC3);
+
+    int rows = img.rows;
+    int cols = img.cols;
+
+    int tilesY = tileActiveMask.rows;
+    int tilesX = tileActiveMask.cols;
+
+    cv::Mat cur  = img.clone();
+    cv::Mat next = img.clone();
+
+    for (int it = 0; it < iterations; ++it) {
+        for (int y = 0; y < rows; ++y) {
+            int ty = y / tileSize;
+            if (ty >= tilesY) ty = tilesY - 1;
+
+            for (int x = 0; x < cols; ++x) {
+                int tx = x / tileSize;
+                if (tx >= tilesX) tx = tilesX - 1;
+
+                uint8_t active = tileActiveMask.at<uint8_t>(ty, tx);
+
+                if (!active) {
+                    // static tile: no smoothing, just copy
+                    next.at<cv::Vec3b>(y, x) = cur.at<cv::Vec3b>(y, x);
+                    continue;
+                }
+
+                if (mask.at<uint8_t>(y, x) == 1) {
+                    next.at<cv::Vec3b>(y, x) = cur.at<cv::Vec3b>(y, x);
+                } else {
+                    next.at<cv::Vec3b>(y, x) =
+                        average3x3MissingAware(cur, mask, y, x);
+                }
+            }
+        }
+        std::swap(cur, next);
+    }
+
+    img = cur;
 }
