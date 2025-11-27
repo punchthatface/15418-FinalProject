@@ -61,7 +61,7 @@ int main(int argc, char** argv) {
 
         // 3) Iterative local refinement
         int iterations = 3;  // tune: 2-5 typical
-        iterativeRefine(spatialRecon, mask, iterations);ew
+        iterativeRefine(spatialRecon, mask, iterations);
 
 
         double mse = computeMSE(frame, spatialRecon);
