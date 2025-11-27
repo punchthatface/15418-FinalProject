@@ -3,7 +3,7 @@
 #include <string>
 #include <opencv2/opencv.hpp>
 #include <chrono>
-
+#include <omp.h>
 #include "recon.h"
 #include "metrics.h"
 
@@ -81,27 +81,30 @@ int main(int argc, char** argv) {
             // 4) For active tiles, compute new reconstruction (bilinear) *just there*
             int tilesY = tileActive.rows;
             int tilesX = tileActive.cols;
+            #pragma omp parallel
+            {
+                #pragma omp for schedule(static) nowait
+                for (int ty = 0; ty < tilesY; ++ty) {
+                    for (int tx = 0; tx < tilesX; ++tx) {
+                        uint8_t active = tileActive.at<uint8_t>(ty, tx);
+                        if (!active) continue; // static tile: keep prevRecon
 
-            for (int ty = 0; ty < tilesY; ++ty) {
-                for (int tx = 0; tx < tilesX; ++tx) {
-                    uint8_t active = tileActive.at<uint8_t>(ty, tx);
-                    if (!active) continue; // static tile: keep prevRecon
+                        int y0 = ty * TILE_SIZE;
+                        int x0 = tx * TILE_SIZE;
+                        int y1 = std::min(y0 + TILE_SIZE, height);
+                        int x1 = std::min(x0 + TILE_SIZE, width);
 
-                    int y0 = ty * TILE_SIZE;
-                    int x0 = tx * TILE_SIZE;
-                    int y1 = std::min(y0 + TILE_SIZE, height);
-                    int x1 = std::min(x0 + TILE_SIZE, width);
-
-                    for (int y = y0; y < y1; ++y) {
-                        for (int x = x0; x < x1; ++x) {
-                            if (mask.at<uint8_t>(y, x) == 1) {
-                                // known subsampled pixel
-                                finalRecon.at<cv::Vec3b>(y, x) =
-                                    subsampled.at<cv::Vec3b>(y, x);
-                            } else {
-                                // missing pixel: reconstruct using bilinear
-                                finalRecon.at<cv::Vec3b>(y, x) =
-                                    bilinearPredict(subsampled, mask, y, x, subsampleFactor);
+                        for (int y = y0; y < y1; ++y) {
+                            for (int x = x0; x < x1; ++x) {
+                                if (mask.at<uint8_t>(y, x) == 1) {
+                                    // known subsampled pixel
+                                    finalRecon.at<cv::Vec3b>(y, x) =
+                                        subsampled.at<cv::Vec3b>(y, x);
+                                } else {
+                                    // missing pixel: reconstruct using bilinear
+                                    finalRecon.at<cv::Vec3b>(y, x) =
+                                        bilinearPredict(subsampled, mask, y, x, subsampleFactor);
+                                }
                             }
                         }
                     }

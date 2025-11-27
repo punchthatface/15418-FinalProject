@@ -1,5 +1,6 @@
 #include "recon.h"
 #include <algorithm>
+#include <omp.h>
 
 void subsampleFrame(const cv::Mat& input,
                     cv::Mat& subsampled,
@@ -8,12 +9,15 @@ void subsampleFrame(const cv::Mat& input,
 {
     subsampled = cv::Mat::zeros(input.size(), input.type());
     mask       = cv::Mat::zeros(input.size(), CV_8UC1);
-
-    for (int y = 0; y < input.rows; ++y) {
-        for (int x = 0; x < input.cols; ++x) {
-            if ((x % factor == 0) && (y % factor == 0)) {
-                subsampled.at<cv::Vec3b>(y, x) = input.at<cv::Vec3b>(y, x);
-                mask.at<uint8_t>(y, x) = 1;
+    #pragma omp parallel
+    {
+        #pragma omp for schedule(static) nowait
+        for (int y = 0; y < input.rows; ++y) {
+            for (int x = 0; x < input.cols; ++x) {
+                if ((x % factor == 0) && (y % factor == 0)) {
+                    subsampled.at<cv::Vec3b>(y, x) = input.at<cv::Vec3b>(y, x);
+                    mask.at<uint8_t>(y, x) = 1;
+                }
             }
         }
     }
@@ -162,25 +166,27 @@ void iterativeRefine(cv::Mat& img,
 
     cv::Mat cur  = img.clone();
     cv::Mat next = img.clone();
-
-    for (int it = 0; it < iterations; ++it) {
-        for (int y = 0; y < img.rows; ++y) {
-            for (int x = 0; x < img.cols; ++x) {
-                if (mask.at<uint8_t>(y, x) == 1) {
-                    // Known pixels stay fixed – they “anchor” the solution
-                    next.at<cv::Vec3b>(y, x) = cur.at<cv::Vec3b>(y, x);
-                } else {
-                    // Only refine missing pixels
-                    next.at<cv::Vec3b>(y, x) =
-                        average3x3MissingAware(cur, mask, y, x);
+    #pragma omp parallel
+    {
+        #pragma omp for schedule(static) nowait
+        for (int it = 0; it < iterations; ++it) {
+            for (int y = 0; y < img.rows; ++y) {
+                for (int x = 0; x < img.cols; ++x) {
+                    if (mask.at<uint8_t>(y, x) == 1) {
+                        // Known pixels stay fixed – they “anchor” the solution
+                        next.at<cv::Vec3b>(y, x) = cur.at<cv::Vec3b>(y, x);
+                    } else {
+                        // Only refine missing pixels
+                        next.at<cv::Vec3b>(y, x) =
+                            average3x3MissingAware(cur, mask, y, x);
+                    }
                 }
             }
+            // Jacobi-style update: swap buffers
+            std::swap(cur, next);
         }
-        // Jacobi-style update: swap buffers
-        std::swap(cur, next);
+        img = cur; // Final refined image
     }
-
-    img = cur; // Final refined image
 }
 
 void classifyTilesSADSubsample(const cv::Mat& currSubsampled,
@@ -265,27 +271,31 @@ void iterativeRefineTiles(cv::Mat& img,
     cv::Mat next = img.clone();
 
     for (int it = 0; it < iterations; ++it) {
-        for (int y = 0; y < rows; ++y) {
-            int ty = y / tileSize;
-            if (ty >= tilesY) ty = tilesY - 1;
+        #pragma omp parallel
+        {
+            #pragma omp for schedule(static) nowait
+            for (int y = 0; y < rows; ++y) {
+                int ty = y / tileSize;
+                if (ty >= tilesY) ty = tilesY - 1;
 
-            for (int x = 0; x < cols; ++x) {
-                int tx = x / tileSize;
-                if (tx >= tilesX) tx = tilesX - 1;
+                for (int x = 0; x < cols; ++x) {
+                    int tx = x / tileSize;
+                    if (tx >= tilesX) tx = tilesX - 1;
 
-                uint8_t active = tileActiveMask.at<uint8_t>(ty, tx);
+                    uint8_t active = tileActiveMask.at<uint8_t>(ty, tx);
 
-                if (!active) {
-                    // static tile: no smoothing, just copy
-                    next.at<cv::Vec3b>(y, x) = cur.at<cv::Vec3b>(y, x);
-                    continue;
-                }
+                    if (!active) {
+                        // static tile: no smoothing, just copy
+                        next.at<cv::Vec3b>(y, x) = cur.at<cv::Vec3b>(y, x);
+                        continue;
+                    }
 
-                if (mask.at<uint8_t>(y, x) == 1) {
-                    next.at<cv::Vec3b>(y, x) = cur.at<cv::Vec3b>(y, x);
-                } else {
-                    next.at<cv::Vec3b>(y, x) =
-                        average3x3MissingAware(cur, mask, y, x);
+                    if (mask.at<uint8_t>(y, x) == 1) {
+                        next.at<cv::Vec3b>(y, x) = cur.at<cv::Vec3b>(y, x);
+                    } else {
+                        next.at<cv::Vec3b>(y, x) =
+                            average3x3MissingAware(cur, mask, y, x);
+                    }
                 }
             }
         }
