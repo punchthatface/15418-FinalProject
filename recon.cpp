@@ -220,6 +220,8 @@ void classifyTilesSADSubsample(const cv::Mat& currSubsampled,
 
     tileActiveMask = cv::Mat::zeros(tilesY, tilesX, CV_8UC1);
 
+    // Parallelize over tiles (2D) – each (ty,tx) is independent
+    #pragma omp parallel for collapse(2) schedule(static)
     for (int ty = 0; ty < tilesY; ++ty) {
         for (int tx = 0; tx < tilesX; ++tx) {
             int y0 = ty * tileSize;
@@ -244,7 +246,9 @@ void classifyTilesSADSubsample(const cv::Mat& currSubsampled,
             }
 
             if (pixelCount == 0) {
-                tileActiveMask.at<uint8_t>(ty, tx) = 1; // edge case: treat as active
+                // Edge case: if the tile has no pixels (should be rare),
+                // treat it as active so we don't accidentally skip it.
+                tileActiveMask.at<uint8_t>(ty, tx) = 1;
                 continue;
             }
 
@@ -255,6 +259,8 @@ void classifyTilesSADSubsample(const cv::Mat& currSubsampled,
         }
     }
 }
+
+
 
 void iterativeRefineTiles(cv::Mat& img,
                           const cv::Mat& mask,

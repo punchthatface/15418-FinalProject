@@ -38,7 +38,8 @@ struct ImageSequenceReader {
 
 enum RunMode {
     MODE_CUDA,
-    MODE_BASELINE
+    MODE_BASELINE,
+    MODE_OMP_ONLY
 };
 
 int main(int argc, char** argv) {
@@ -50,7 +51,9 @@ int main(int argc, char** argv) {
                   << "  --force-images   : force image-sequence input (no VideoCapture)\n"
                   << "  --no-output      : do not write video output\n"
                   << "  --baseline       : CPU baseline (OpenMP forced to 1 thread, no CUDA)\n"
+                  << "  --omp-only       : CPU, OpenMP multi-thread, no CUDA\n"
                   << "  --cuda           : CPU + CUDA refinement (default if no mode flag given)\n"
+                  << "  --no-metrics     : disable MSE/SSIM computation (timing-only mode)\n"
                   << "Notes:\n"
                   << "  - In image mode, expects <input>/frame_%06d.png or .jpg\n"
                   << "  - If <output> is '-' or 'none', output is disabled.\n";
@@ -69,6 +72,7 @@ int main(int argc, char** argv) {
     bool forceVideo    = false;
     bool forceImages   = false;
     bool disableOutput = false;
+    bool metricsEnabled = true;
 
     RunMode mode = MODE_CUDA;  // default if no explicit mode flag
 
@@ -82,11 +86,12 @@ int main(int argc, char** argv) {
             disableOutput = true;
         } else if (flag == "--baseline") {
             mode = MODE_BASELINE;
+        } else if (flag == "--omp-only") {
+            mode = MODE_OMP_ONLY;
         } else if (flag == "--cuda") {
             mode = MODE_CUDA;
-        } else if (flag == "--omp-only") {
-            std::cerr << "[Warn] --omp-only mode is no longer supported; treating as --baseline.\n";
-            mode = MODE_BASELINE;
+        } else if (flag == "--no-metrics") {
+            metricsEnabled = false;
         }
     }
 
@@ -104,8 +109,14 @@ int main(int argc, char** argv) {
     // Mode info
     if (mode == MODE_BASELINE) {
         std::cout << "[Init] Run mode: BASELINE (CPU, OpenMP forced to 1 thread, no CUDA)\n";
+    } else if (mode == MODE_OMP_ONLY) {
+        std::cout << "[Init] Run mode: OMP-ONLY (CPU, OpenMP multi-thread, no CUDA)\n";
     } else {
         std::cout << "[Init] Run mode: CUDA (CPU + CUDA refinement)\n";
+    }
+
+    if (!metricsEnabled) {
+        std::cout << "[Init] Metrics disabled: skipping MSE/SSIM computation.\n";
     }
 
     // Baseline: force OpenMP to 1 thread
@@ -277,12 +288,15 @@ int main(int argc, char** argv) {
     } else {
         std::cout << "[Init] CUDA refinement disabled in this mode.\n";
     }
+#else
+    bool cuda_ok = false;
+    std::cout << "[Init] CUDA refinement not compiled in.\n";
 #endif
 
     // -------------------------------
     // Timing accumulators
     // -------------------------------
-    // Compute stages (we care most about these)
+    // Compute stages
     double subsample_ms      = 0.0;
     double classify_ms       = 0.0;
     double recon_full_ms     = 0.0; // frame 0
@@ -423,7 +437,7 @@ int main(int argc, char** argv) {
                             int x1 = std::min(x0 + TILE_SIZE, cols);
 
                             for (int y = y0; y < y1; ++y) {
-                                for (int x = x0; x < x1; ++x) {
+                                for (int x = x0; x1 && x < x1; ++x) {
                                     if (mask.at<uint8_t>(y, x) == 1) {
                                         finalRecon.at<cv::Vec3b>(y, x) =
                                             subsampled.at<cv::Vec3b>(y, x);
@@ -462,8 +476,8 @@ int main(int argc, char** argv) {
             }
         }
 
-        // (5) Metrics (excluded from pipeline & compute timing)
-        {
+        // (5) Metrics (optional)
+        if (metricsEnabled) {
             auto t0 = Clock::now();
             double mse  = computeMSE(frame, finalRecon);
             double ssim = computeSSIM(frame, finalRecon);
@@ -476,7 +490,7 @@ int main(int argc, char** argv) {
 
         frameCount++;
 
-        // (6) Output (optional) – we still time it, but keep separate
+        // (6) Output (optional)
         if (writeOutput) {
             auto t0 = Clock::now();
             writer.write(finalRecon);
@@ -502,9 +516,15 @@ int main(int argc, char** argv) {
     if (compute_ms < 0) compute_ms = 0.0;
     double computeSec = compute_ms / 1000.0;
 
-    double avgMSE  = (frameCount > 0) ? (totalMSE  / frameCount) : 0.0;
-    double avgSSIM = (frameCount > 0) ? (totalSSIM / frameCount) : 0.0;
-    double psnr    = mseToPSNR(avgMSE);
+    double avgMSE  = 0.0;
+    double avgSSIM = 0.0;
+    double psnr    = 0.0;
+
+    if (metricsEnabled && frameCount > 0) {
+        avgMSE  = totalMSE  / frameCount;
+        avgSSIM = totalSSIM / frameCount;
+        psnr    = mseToPSNR(avgMSE);
+    }
 
     // ---------------------------------------
     // High-level summary
@@ -516,6 +536,8 @@ int main(int argc, char** argv) {
 #ifdef USE_CUDA_REFINEMENT
     if (mode == MODE_BASELINE) {
         std::cout << "Refinement backend: CPU baseline (1 thread, no CUDA)\n";
+    } else if (mode == MODE_OMP_ONLY) {
+        std::cout << "Refinement backend: CPU (OpenMP, no CUDA)\n";
     } else {
         std::cout << "Refinement backend: "
                   << (cuda_ok ? "CUDA\n" : "CPU (CUDA requested, fallback)\n");
@@ -524,9 +546,15 @@ int main(int argc, char** argv) {
     std::cout << "Refinement backend: CPU (OpenMP)\n";
 #endif
 
-    std::cout << "Avg MSE:   " << avgMSE  << "\n";
-    std::cout << "Avg SSIM:  " << avgSSIM << "\n";
-    std::cout << "Avg PSNR:  " << psnr    << " dB\n\n";
+    if (metricsEnabled) {
+        std::cout << "Avg MSE:   " << avgMSE  << "\n";
+        std::cout << "Avg SSIM:  " << avgSSIM << "\n";
+        std::cout << "Avg PSNR:  " << psnr    << " dB\n\n";
+    } else {
+        std::cout << "Avg MSE:   N/A (metrics disabled)\n";
+        std::cout << "Avg SSIM:  N/A (metrics disabled)\n";
+        std::cout << "Avg PSNR:  N/A (metrics disabled)\n\n";
+    }
 
     std::cout << "Total time (ALL, incl. metrics & I/O): "
               << totalSec << " sec\n";
@@ -562,12 +590,16 @@ int main(int argc, char** argv) {
         std::cout << "N/A ms/frame\n\n";
     }
 
-    std::cout << "Metrics time: "
-              << (metrics_ms / 1000.0) << " sec total, ";
-    if (frameCount > 0) {
-        std::cout << (metrics_ms / frameCount) << " ms/frame\n\n";
+    if (metricsEnabled) {
+        std::cout << "Metrics time: "
+                  << (metrics_ms / 1000.0) << " sec total, ";
+        if (frameCount > 0) {
+            std::cout << (metrics_ms / frameCount) << " ms/frame\n\n";
+        } else {
+            std::cout << "N/A ms/frame\n\n";
+        }
     } else {
-        std::cout << "N/A ms/frame\n\n";
+        std::cout << "Metrics time: 0 sec (metrics disabled)\n\n";
     }
 
     // ---------------------------------------
