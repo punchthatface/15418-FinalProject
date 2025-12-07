@@ -31,3 +31,10 @@ void iterativeRefineTilesCUDA(cv::Mat& img,
 // Safe to call even if CUDA was never used (it will just print zeros).
 void cudaPrintRefineStats();
 
+void reconstructTilesCUDA(cv::Mat& finalRecon,
+                          const cv::Mat& prevRecon,
+                          const cv::Mat& subsampled,
+                          const cv::Mat& mask,
+                          const cv::Mat& tileActiveMask,
+                          int tileSize,
+                          int factor);

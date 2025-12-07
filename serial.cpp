@@ -1,10 +1,13 @@
 #include <iostream>
 #include <vector>
 #include <string>
-#include <cstdio>
-#include <cmath>
-#include <opencv2/opencv.hpp>
+#include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <dirent.h>
+#include <sys/types.h>
+
+#include <opencv2/opencv.hpp>
 #include <omp.h>
 
 #include "recon.h"
@@ -16,634 +19,580 @@
 
 using Clock = std::chrono::high_resolution_clock;
 
-// Simple image-sequence reader: dir/frame_%06d.png or .jpg
-struct ImageSequenceReader {
-    std::string dir;
-    int index;
-    std::string ext; // ".png" or ".jpg"
-
-    ImageSequenceReader(const std::string& d, const std::string& e = ".png")
-        : dir(d), index(1), ext(e) {}
-
-    void reset() { index = 1; }
-
-    bool read(cv::Mat& out) {
-        char buf[512];
-        std::snprintf(buf, sizeof(buf), "%s/frame_%06d%s",
-                      dir.c_str(), index++, ext.c_str());
-        out = cv::imread(buf, cv::IMREAD_COLOR);
-        return !out.empty();
-    }
+enum class RunMode {
+    BASELINE,   // OpenMP forced to 1 thread, no CUDA
+    OMP_ONLY,   // OpenMP multi-thread, no CUDA
+    CUDA        // OpenMP + CUDA refinement / reconstruction
 };
 
-enum RunMode {
-    MODE_CUDA,
-    MODE_BASELINE,
-    MODE_OMP_ONLY
-};
+struct Args {
+    std::string inputPath;
+    std::string outputPath;
+    int subsampleFactor = 2;
 
-int main(int argc, char** argv) {
-    if (argc < 3) {
-        std::cerr << "Usage: " << argv[0]
-                  << " <input_video_or_frame_dir> <output_video_or_dash> [subsample_factor] [flags...]\n"
-                  << "Flags:\n"
-                  << "  --force-video    : force video input (VideoCapture only)\n"
-                  << "  --force-images   : force image-sequence input (no VideoCapture)\n"
-                  << "  --no-output      : do not write video output\n"
-                  << "  --baseline       : CPU baseline (OpenMP forced to 1 thread, no CUDA)\n"
-                  << "  --omp-only       : CPU, OpenMP multi-thread, no CUDA\n"
-                  << "  --cuda           : CPU + CUDA refinement (default if no mode flag given)\n"
-                  << "  --no-metrics     : disable MSE/SSIM computation (timing-only mode)\n"
-                  << "Notes:\n"
-                  << "  - In image mode, expects <input>/frame_%06d.png or .jpg\n"
-                  << "  - If <output> is '-' or 'none', output is disabled.\n";
-        return 1;
-    }
-
-    std::string inputPath  = argv[1];
-    std::string outputPath = argv[2];
-    int subsampleFactor    = 2;
-
-    if (argc >= 4 && argv[3][0] != '-') {
-        subsampleFactor = std::stoi(argv[3]);
-    }
-
-    // Parse flags
-    bool forceVideo    = false;
-    bool forceImages   = false;
-    bool disableOutput = false;
+    bool forceImages    = false;
+    bool outputEnabled  = true;
     bool metricsEnabled = true;
 
-    RunMode mode = MODE_CUDA;  // default if no explicit mode flag
+    RunMode mode = RunMode::CUDA;
+};
+
+static Args parseArgs(int argc, char** argv) {
+    if (argc < 3) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <input_video | image_dir> <output_video | -> [subsample_factor] [flags]\n"
+                  << "Flags:\n"
+                  << "  --force-images    : treat input as image-sequence directory\n"
+                  << "  --no-output       : do not write output video\n"
+                  << "  --baseline        : baseline mode (1 thread, no CUDA)\n"
+                  << "  --omp-only        : OpenMP-only mode (multi-thread, no CUDA)\n"
+                  << "  (default, if CUDA compiled) : CUDA mode (CPU + CUDA refinement)\n"
+                  << "  --no-metrics      : disable MSE/SSIM/PSNR computation\n";
+        std::exit(1);
+    }
+
+    Args args;
+    args.inputPath  = argv[1];
+    args.outputPath = argv[2];
+
+    // Optional subsample factor if given and not a flag
+    if (argc >= 4 && argv[3][0] != '-') {
+        args.subsampleFactor = std::max(1, std::atoi(argv[3]));
+    }
 
     for (int i = 3; i < argc; ++i) {
-        std::string flag = argv[i];
-        if (flag == "--force-video") {
-            forceVideo = true;
-        } else if (flag == "--force-images") {
-            forceImages = true;
-        } else if (flag == "--no-output") {
-            disableOutput = true;
-        } else if (flag == "--baseline") {
-            mode = MODE_BASELINE;
-        } else if (flag == "--omp-only") {
-            mode = MODE_OMP_ONLY;
-        } else if (flag == "--cuda") {
-            mode = MODE_CUDA;
-        } else if (flag == "--no-metrics") {
-            metricsEnabled = false;
+        std::string a = argv[i];
+        if (a == "--force-images") {
+            args.forceImages = true;
+        } else if (a == "--no-output") {
+            args.outputEnabled = false;
+        } else if (a == "--baseline") {
+            args.mode = RunMode::BASELINE;
+        } else if (a == "--omp-only") {
+            args.mode = RunMode::OMP_ONLY;
+        } else if (a == "--no-metrics") {
+            args.metricsEnabled = false;
         }
     }
 
-    // Check for conflicting input flags
-    if (forceVideo && forceImages) {
-        std::cerr << "Error: --force-video and --force-images cannot both be set.\n";
-        return 1;
+    if (args.outputPath == "-") {
+        args.outputEnabled = false;
     }
 
-    // If output path is "-" or "none", treat as no-output.
-    if (outputPath == "-" || outputPath == "none") {
-        disableOutput = true;
+#ifndef USE_CUDA_REFINEMENT
+    if (args.mode == RunMode::CUDA) {
+        args.mode = RunMode::OMP_ONLY;
     }
-
-    // Mode info
-    if (mode == MODE_BASELINE) {
-        std::cout << "[Init] Run mode: BASELINE (CPU, OpenMP forced to 1 thread, no CUDA)\n";
-    } else if (mode == MODE_OMP_ONLY) {
-        std::cout << "[Init] Run mode: OMP-ONLY (CPU, OpenMP multi-thread, no CUDA)\n";
-    } else {
-        std::cout << "[Init] Run mode: CUDA (CPU + CUDA refinement)\n";
-    }
-
-    if (!metricsEnabled) {
-        std::cout << "[Init] Metrics disabled: skipping MSE/SSIM computation.\n";
-    }
-
-    // Baseline: force OpenMP to 1 thread
-    if (mode == MODE_BASELINE) {
-        omp_set_dynamic(0);
-        omp_set_num_threads(1);
-    }
-
-    // -------------------------------
-    // Input mode selection
-    // -------------------------------
-    cv::VideoCapture cap;
-    bool useVideoCapture = false;
-
-    // Image reader: we'll try .png first; if first frame fails, we'll try .jpg
-    ImageSequenceReader imgSeqPng(inputPath, ".png");
-    ImageSequenceReader imgSeqJpg(inputPath, ".jpg");
-    ImageSequenceReader* imgSeq = &imgSeqPng;
-
-    cv::Mat firstFrame;
-    int width  = 0;
-    int height = 0;
-    double fps = 30.0; // default
-
-    if (forceImages) {
-        std::cout << "[Init] Forcing image-sequence input from directory: "
-                  << inputPath << "\n";
-
-        // Try PNG first
-        if (!imgSeqPng.read(firstFrame) || firstFrame.empty()) {
-            // Try JPG
-            imgSeq = &imgSeqJpg;
-            imgSeqJpg.reset();
-            if (!imgSeqJpg.read(firstFrame) || firstFrame.empty()) {
-                std::cerr << "Failed to read first frame from directory (PNG or JPG): "
-                          << inputPath << "/frame_000001.{png,jpg}\n";
-                return 1;
-            }
-        } else {
-            imgSeq = &imgSeqPng;
-        }
-
-        width  = firstFrame.cols;
-        height = firstFrame.rows;
-        fps    = 30.0; // arbitrary for VideoWriter
-
-        imgSeq->reset(); // reset to start from frame_000001 in main loop
-        useVideoCapture = false;
-    } else if (forceVideo) {
-        std::cout << "[Init] Forcing video input via VideoCapture: "
-                  << inputPath << "\n";
-        cap.open(inputPath);
-        if (!cap.isOpened()) {
-            std::cerr << "Error: failed to open video with --force-video: "
-                      << inputPath << "\n";
-            return 1;
-        }
-        if (!cap.read(firstFrame) || firstFrame.empty()) {
-            std::cerr << "Error: unable to read first frame from video: "
-                      << inputPath << "\n";
-            return 1;
-        }
-        width  = firstFrame.cols;
-        height = firstFrame.rows;
-        fps    = cap.get(cv::CAP_PROP_FPS);
-        if (fps <= 0.0 || std::isnan(fps)) {
-            fps = 30.0;
-        }
-        // Rewind video
-        cap.release();
-        cap.open(inputPath);
-        if (!cap.isOpened()) {
-            std::cerr << "Unexpected failure reopening video after probing.\n";
-            return 1;
-        }
-        useVideoCapture = true;
-    } else {
-        // Auto mode: try VideoCapture, then fallback to images
-        std::cout << "[Init] Auto input mode: trying VideoCapture first...\n";
-        cap.open(inputPath);
-        if (cap.isOpened()) {
-            if (!cap.read(firstFrame) || firstFrame.empty()) {
-                std::cerr << "Failed to read first frame from video: "
-                          << inputPath << "\n";
-                cap.release();
-            } else {
-                width  = firstFrame.cols;
-                height = firstFrame.rows;
-                fps    = cap.get(cv::CAP_PROP_FPS);
-                if (fps <= 0.0 || std::isnan(fps)) {
-                    fps = 30.0;
-                }
-                // Rewind
-                cap.release();
-                cap.open(inputPath);
-                if (!cap.isOpened()) {
-                    std::cerr << "Unexpected failure reopening video after probing.\n";
-                    return 1;
-                }
-                useVideoCapture = true;
-                std::cout << "[Init] Using VideoCapture for input: " << inputPath << "\n";
-            }
-        }
-
-        if (!useVideoCapture) {
-            std::cout << "[Init] VideoCapture failed; falling back to image-sequence mode from directory: "
-                      << inputPath << "\n";
-
-            // Try PNG first
-            if (!imgSeqPng.read(firstFrame) || firstFrame.empty()) {
-                // Try JPG
-                imgSeq = &imgSeqJpg;
-                imgSeqJpg.reset();
-                if (!imgSeqJpg.read(firstFrame) || firstFrame.empty()) {
-                    std::cerr << "Failed to read first frame from directory (PNG or JPG): "
-                              << inputPath << "/frame_000001.{png,jpg}\n";
-                    return 1;
-                }
-            } else {
-                imgSeq = &imgSeqPng;
-            }
-
-            width  = firstFrame.cols;
-            height = firstFrame.rows;
-            fps    = 30.0; // arbitrary
-            imgSeq->reset();
-            useVideoCapture = false;
-        }
-    }
-
-    // -------------------------------
-    // Output video (optional)
-    // -------------------------------
-    bool writeOutput = !disableOutput;
-    cv::VideoWriter writer;
-
-    if (writeOutput) {
-        writer.open(
-            outputPath,
-            cv::VideoWriter::fourcc('a', 'v', 'c', '1'),
-            fps,
-            cv::Size(width, height)
-        );
-
-        if (!writer.isOpened()) {
-            std::cerr << "Warning: failed to open output video: " << outputPath << "\n"
-                      << "On PSC, this may be due to missing codecs. "
-                      << "Continuing without video output.\n";
-            writeOutput = false;
-        } else {
-            std::cout << "[Init] Output video: " << outputPath << "\n";
-        }
-    } else {
-        std::cout << "[Init] Video output disabled.\n";
-    }
-
-    // -------------------------------
-    // CUDA detection (once)
-    // -------------------------------
-#ifdef USE_CUDA_REFINEMENT
-    bool cuda_ok = false;
-    if (mode == MODE_CUDA) {
-        cuda_ok = cudaRefinementInit();
-        if (cuda_ok) {
-            std::cout << "[Init] CUDA refinement enabled.\n";
-        } else {
-            std::cout << "[Init] CUDA NOT available — refinement will run on CPU.\n";
-        }
-    } else {
-        std::cout << "[Init] CUDA refinement disabled in this mode.\n";
-    }
-#else
-    bool cuda_ok = false;
-    std::cout << "[Init] CUDA refinement not compiled in.\n";
 #endif
 
-    // -------------------------------
-    // Timing accumulators
-    // -------------------------------
-    // Compute stages
-    double subsample_ms      = 0.0;
-    double classify_ms       = 0.0;
-    double recon_full_ms     = 0.0; // frame 0
-    double recon_tiles_ms    = 0.0; // subsequent frames
-    double refine_full_ms    = 0.0;
-    double refine_tiles_ms   = 0.0;
+    return args;
+}
 
-    // I/O + metrics
-    double input_io_ms       = 0.0; // imread / VideoCapture read
-    double output_io_ms      = 0.0; // writer.write
-    double metrics_ms        = 0.0;
+// --------- Image-sequence helpers ---------
 
-    double totalMSE          = 0.0;
-    double totalSSIM         = 0.0;
-    int frameCount           = 0;
+static bool hasImageExtension(const std::string& name) {
+    std::string lower = name;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    if (lower.size() < 4) return false;
+    if (lower.rfind(".png")  == lower.size() - 4) return true;
+    if (lower.rfind(".jpg")  == lower.size() - 4) return true;
+    if (lower.rfind(".jpeg") == lower.size() - 5) return true;
+    return false;
+}
 
-    // Tile statistics
-    long long totalTiles       = 0;
-    long long totalActiveTiles = 0;
+static std::vector<std::string> listImagesInDir(const std::string& dir) {
+    std::vector<std::string> files;
+    DIR* d = opendir(dir.c_str());
+    if (!d) {
+        std::perror("opendir");
+        return files;
+    }
+    struct dirent* ent;
+    while ((ent = readdir(d)) != nullptr) {
+        std::string name = ent->d_name;
+        if (name == "." || name == "..") continue;
+        if (hasImageExtension(name)) {
+            files.push_back(name);
+        }
+    }
+    closedir(d);
+    std::sort(files.begin(), files.end());
+    return files;
+}
 
-    cv::Mat prevRecon;
-    cv::Mat prevSubsampled;
+int main(int argc, char** argv) {
+    Args args = parseArgs(argc, argv);
 
     const int    TILE_SIZE   = 2;
     const double SAD_THRESH  = 1.0;
     const int    ITERATIONS  = 3;
 
-    auto startTotal = Clock::now();
+    // Configure OpenMP threads according to mode
+    if (args.mode == RunMode::BASELINE) {
+        omp_set_num_threads(1);
+        std::cout << "[Init] Run mode: BASELINE (CPU, OpenMP forced to 1 thread, no CUDA)\n";
+    } else if (args.mode == RunMode::OMP_ONLY) {
+        std::cout << "[Init] Run mode: OMP-ONLY (CPU, OpenMP multi-thread, no CUDA)\n";
+    } else {
+        std::cout << "[Init] Run mode: CUDA (CPU + CUDA refinement)\n";
+    }
 
-    // Abstracted frame reader
-    auto readNextFrame = [&](cv::Mat& out)->bool {
-        if (useVideoCapture) {
-            return cap.read(out);
-        } else {
-            return imgSeq->read(out);
+#ifdef USE_CUDA_REFINEMENT
+    if (args.mode == RunMode::CUDA) {
+        if (!cudaRefinementInit()) {
+            std::cout << "[Init] CUDA not available, falling back to OMP-ONLY.\n";
+            args.mode = RunMode::OMP_ONLY;
         }
-    };
+    }
+#endif
 
-    cv::Mat frame;
+    // Input setup: video vs image-sequence
+    bool useImageSeq = args.forceImages;
+    cv::VideoCapture cap;
+    std::vector<std::string> imageFiles;
+
+    if (!useImageSeq) {
+        cap.open(args.inputPath);
+        if (!cap.isOpened()) {
+            std::cerr << "Failed to open video input: " << args.inputPath << "\n";
+            std::cerr << "Hint: use --force-images if this is a directory of frames.\n";
+            return 1;
+        }
+    } else {
+        std::cout << "[Init] Forcing image-sequence input from directory: "
+                  << args.inputPath << "\n";
+        imageFiles = listImagesInDir(args.inputPath);
+        if (imageFiles.empty()) {
+            std::cerr << "No images found in directory: " << args.inputPath << "\n";
+            return 1;
+        }
+    }
+
+    if (!args.outputEnabled) {
+        std::cout << "[Init] Video output disabled.\n";
+    }
+    if (!args.metricsEnabled) {
+        std::cout << "[Init] Metrics disabled (no MSE/SSIM/PSNR).\n";
+    }
+
+    // Determine frame size & fps
+    cv::Size frameSize;
+    double fps = 30.0;
+
+    if (!useImageSeq) {
+        frameSize = cv::Size(
+            (int)cap.get(cv::CAP_PROP_FRAME_WIDTH),
+            (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT)
+        );
+        fps = cap.get(cv::CAP_PROP_FPS);
+        if (fps <= 0.0 || std::isnan(fps)) {
+            fps = 30.0;
+        }
+    } else {
+        std::string firstPath = args.inputPath + "/" + imageFiles[0];
+        cv::Mat tmp = cv::imread(firstPath, cv::IMREAD_COLOR);
+        if (tmp.empty()) {
+            std::cerr << "Failed to read first image: " << firstPath << "\n";
+            return 1;
+        }
+        frameSize = tmp.size();
+        fps = 30.0;
+    }
+
+    // Output writer
+    cv::VideoWriter writer;
+    if (args.outputEnabled) {
+        writer.open(args.outputPath,
+                    cv::VideoWriter::fourcc('m','p','4','v'),
+                    fps,
+                    frameSize);
+        if (!writer.isOpened()) {
+            std::cerr << "Failed to open output video: " << args.outputPath << "\n";
+            return 1;
+        }
+    }
+
+    // Timing accumulators (ms)
+    double total_input_ms   = 0.0;
+    double total_output_ms  = 0.0;
+    double total_compute_ms = 0.0;
+    double total_metrics_ms = 0.0;
+
+    double subsample_ms    = 0.0;
+    double classify_ms     = 0.0;
+    double recon_full_ms   = 0.0;
+    double recon_tiles_ms  = 0.0;
+    double refine_full_ms  = 0.0;
+    double refine_tiles_ms = 0.0;
+
+    // Tile statistics
+    long long totalTiles_sum        = 0;
+    long long totalActiveTiles_sum  = 0;
+    int       framesWithTiles       = 0;
+
+    // Metrics accumulators
+    double sumMSE   = 0.0;
+    double sumSSIM  = 0.0;
+    int    metricFrames = 0;
+
+    auto t_all_start = Clock::now();
+
+    cv::Mat prevRecon;
+    cv::Mat prevSubsampled;
+
+    int frameIndex      = 0;
+    int processedFrames = 0;
 
     while (true) {
-        // Measure input I/O time explicitly
-        auto tRead0 = Clock::now();
-        bool ok = readNextFrame(frame);
-        auto tRead1 = Clock::now();
-        input_io_ms += std::chrono::duration<double, std::milli>(tRead1 - tRead0).count();
+        cv::Mat frame;
 
-        if (!ok || frame.empty()) break;
-
-        // (1) Subsample
-        cv::Mat subsampled, mask;
-        {
-            auto t0 = Clock::now();
-            subsampleFrame(frame, subsampled, mask, subsampleFactor);
-            auto t1 = Clock::now();
-            subsample_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        // Input I/O timing
+        auto t_in_start = Clock::now();
+        if (!useImageSeq) {
+            if (!cap.read(frame) || frame.empty()) {
+                break;
+            }
+        } else {
+            if (frameIndex >= (int)imageFiles.size()) {
+                break;
+            }
+            std::string path = args.inputPath + "/" + imageFiles[frameIndex];
+            frame = cv::imread(path, cv::IMREAD_COLOR);
+            if (frame.empty()) {
+                std::cerr << "Failed to read image: " << path << " (skipping)\n";
+                frameIndex++;
+                continue;
+            }
         }
+        auto t_in_end = Clock::now();
+        total_input_ms += std::chrono::duration<double, std::milli>(t_in_end - t_in_start).count();
+
+        if (frame.size() != frameSize) {
+            cv::resize(frame, frame, frameSize);
+        }
+
+        auto t_compute_start = Clock::now();
+
+        // Subsample
+        cv::Mat subsampled, mask;
+        auto t_sub_start = Clock::now();
+        subsampleFrame(frame, subsampled, mask, args.subsampleFactor);
+        auto t_sub_end = Clock::now();
+        subsample_ms += std::chrono::duration<double, std::milli>(t_sub_end - t_sub_start).count();
 
         cv::Mat finalRecon;
 
-        if (prevRecon.empty()) {
-            // FIRST FRAME (no temporal info)
+        if (frameIndex == 0) {
+            // First frame: full reconstruction + full refinement
+            auto t_recon_full_start = Clock::now();
+            reconstructNaive(subsampled, mask, args.subsampleFactor, finalRecon);
+            auto t_recon_full_end = Clock::now();
+            recon_full_ms += std::chrono::duration<double, std::milli>(
+                                 t_recon_full_end - t_recon_full_start).count();
 
-            // Full-frame naive reconstruction
-            {
-                auto t0 = Clock::now();
-                reconstructNaive(subsampled, mask, subsampleFactor, finalRecon);
-                auto t1 = Clock::now();
-                recon_full_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
-            }
-
-            // Full-frame refinement
-            {
-                auto t0 = Clock::now();
+            auto t_refine_full_start = Clock::now();
+            if (args.mode == RunMode::CUDA) {
 #ifdef USE_CUDA_REFINEMENT
-                if (mode == MODE_CUDA && cuda_ok) {
-                    iterativeRefineCUDA(finalRecon, mask, ITERATIONS);
-                } else {
-                    iterativeRefine(finalRecon, mask, ITERATIONS);
-                }
+                iterativeRefineCUDA(finalRecon, mask, ITERATIONS);
 #else
                 iterativeRefine(finalRecon, mask, ITERATIONS);
 #endif
-                auto t1 = Clock::now();
-                refine_full_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            } else {
+                iterativeRefine(finalRecon, mask, ITERATIONS);
             }
+            auto t_refine_full_end = Clock::now();
+            refine_full_ms += std::chrono::duration<double, std::milli>(
+                                  t_refine_full_end - t_refine_full_start).count();
 
         } else {
-            // SUBSEQUENT FRAMES
-
-            // (2) Tile classification
+            // Subsequent frames: tile classify, tile reconstruction, tile refinement
             cv::Mat tileActive;
-            {
-                auto t0 = Clock::now();
-                classifyTilesSADSubsample(subsampled, prevSubsampled,
-                                          TILE_SIZE, SAD_THRESH,
-                                          tileActive);
-                auto t1 = Clock::now();
-                classify_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
-            }
+            auto t_classify_start = Clock::now();
+            classifyTilesSADSubsample(subsampled, prevSubsampled,
+                                      TILE_SIZE, SAD_THRESH,
+                                      tileActive);
+            auto t_classify_end = Clock::now();
+            classify_ms += std::chrono::duration<double, std::milli>(
+                               t_classify_end - t_classify_start).count();
 
-            finalRecon = prevRecon.clone();
-
-            // Track tile statistics
             int tilesY = tileActive.rows;
             int tilesX = tileActive.cols;
-            long long frameTiles = static_cast<long long>(tilesX) * tilesY;
-            totalTiles += frameTiles;
-
-            long long frameActive = 0;
+            long long tilesThisFrame  = (long long)tilesY * tilesX;
+            long long activeThisFrame = 0;
             for (int ty = 0; ty < tilesY; ++ty) {
+                const uint8_t* rowPtr = tileActive.ptr<uint8_t>(ty);
                 for (int tx = 0; tx < tilesX; ++tx) {
-                    if (tileActive.at<uint8_t>(ty, tx)) {
-                        frameActive++;
-                    }
+                    if (rowPtr[tx] != 0) activeThisFrame++;
                 }
             }
-            totalActiveTiles += frameActive;
+            totalTiles_sum       += tilesThisFrame;
+            totalActiveTiles_sum += activeThisFrame;
+            framesWithTiles++;
 
-            // (3) Reconstruction on active tiles
-            {
-                auto t0 = Clock::now();
-
-                int rows   = subsampled.rows;
-                int cols   = subsampled.cols;
-
-                #pragma omp parallel
-                {
-                    #pragma omp for schedule(static) nowait
-                    for (int ty = 0; ty < tilesY; ++ty) {
-                        for (int tx = 0; tx < tilesX; ++tx) {
-                            uint8_t active = tileActive.at<uint8_t>(ty, tx);
-                            if (!active) continue;
-
-                            int y0 = ty * TILE_SIZE;
-                            int x0 = tx * TILE_SIZE;
-                            int y1 = std::min(y0 + TILE_SIZE, rows);
-                            int x1 = std::min(x0 + TILE_SIZE, cols);
-
-                            for (int y = y0; y < y1; ++y) {
-                                for (int x = x0; x1 && x < x1; ++x) {
-                                    if (mask.at<uint8_t>(y, x) == 1) {
-                                        finalRecon.at<cv::Vec3b>(y, x) =
-                                            subsampled.at<cv::Vec3b>(y, x);
-                                    } else {
-                                        finalRecon.at<cv::Vec3b>(y, x) =
-                                            bilinearPredict(subsampled, mask, y, x,
-                                                            subsampleFactor);
-                                    }
+            // Tile reconstruction
+            auto t_recon_tiles_start = Clock::now();
+            if (args.mode == RunMode::CUDA) {
+#ifdef USE_CUDA_REFINEMENT
+                reconstructTilesCUDA(finalRecon,
+                                     prevRecon,
+                                     subsampled,
+                                     mask,
+                                     tileActive,
+                                     TILE_SIZE,
+                                     args.subsampleFactor);
+#else
+                finalRecon = prevRecon.clone();
+                int height = frame.rows;
+                int width  = frame.cols;
+                #pragma omp parallel for schedule(static)
+                for (int ty = 0; ty < tilesY; ++ty) {
+                    for (int tx = 0; tx < tilesX; ++tx) {
+                        uint8_t active = tileActive.at<uint8_t>(ty, tx);
+                        if (!active) continue;
+                        int y0 = ty * TILE_SIZE;
+                        int x0 = tx * TILE_SIZE;
+                        int y1 = std::min(y0 + TILE_SIZE, height);
+                        int x1 = std::min(x0 + TILE_SIZE, width);
+                        for (int y = y0; y < y1; ++y) {
+                            for (int x = x0; x < x1; ++x) {
+                                if (mask.at<uint8_t>(y, x) == 1) {
+                                    finalRecon.at<cv::Vec3b>(y, x) =
+                                        subsampled.at<cv::Vec3b>(y, x);
+                                } else {
+                                    finalRecon.at<cv::Vec3b>(y, x) =
+                                        bilinearPredict(subsampled, mask, y, x, args.subsampleFactor);
                                 }
                             }
                         }
                     }
                 }
-
-                auto t1 = Clock::now();
-                recon_tiles_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
-            }
-
-            // (4) Refinement on active tiles
-            {
-                auto t0 = Clock::now();
-#ifdef USE_CUDA_REFINEMENT
-                if (mode == MODE_CUDA && cuda_ok) {
-                    iterativeRefineTilesCUDA(finalRecon, mask, tileActive,
-                                             TILE_SIZE, ITERATIONS);
-                } else {
-                    iterativeRefineTiles(finalRecon, mask, tileActive,
-                                         TILE_SIZE, ITERATIONS);
-                }
-#else
-                iterativeRefineTiles(finalRecon, mask, tileActive,
-                                     TILE_SIZE, ITERATIONS);
 #endif
-                auto t1 = Clock::now();
-                refine_tiles_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            } else {
+                finalRecon = prevRecon.clone();
+                int height = frame.rows;
+                int width  = frame.cols;
+                #pragma omp parallel for schedule(static)
+                for (int ty = 0; ty < tilesY; ++ty) {
+                    for (int tx = 0; tx < tilesX; ++tx) {
+                        uint8_t active = tileActive.at<uint8_t>(ty, tx);
+                        if (!active) continue;
+                        int y0 = ty * TILE_SIZE;
+                        int x0 = tx * TILE_SIZE;
+                        int y1 = std::min(y0 + TILE_SIZE, height);
+                        int x1 = std::min(x0 + TILE_SIZE, width);
+                        for (int y = y0; y < y1; ++y) {
+                            for (int x = x0; x < x1; ++x) {
+                                if (mask.at<uint8_t>(y, x) == 1) {
+                                    finalRecon.at<cv::Vec3b>(y, x) =
+                                        subsampled.at<cv::Vec3b>(y, x);
+                                } else {
+                                    finalRecon.at<cv::Vec3b>(y, x) =
+                                        bilinearPredict(subsampled, mask, y, x, args.subsampleFactor);
+                                }
+                            }
+                        }
+                    }
+                }
             }
+            auto t_recon_tiles_end = Clock::now();
+            recon_tiles_ms += std::chrono::duration<double, std::milli>(
+                                  t_recon_tiles_end - t_recon_tiles_start).count();
+
+            // Tile refinement
+            auto t_refine_tiles_start = Clock::now();
+            if (args.mode == RunMode::CUDA) {
+#ifdef USE_CUDA_REFINEMENT
+                iterativeRefineTilesCUDA(finalRecon, mask, tileActive, TILE_SIZE, ITERATIONS);
+#else
+                iterativeRefineTiles(finalRecon, mask, tileActive, TILE_SIZE, ITERATIONS);
+#endif
+            } else {
+                iterativeRefineTiles(finalRecon, mask, tileActive, TILE_SIZE, ITERATIONS);
+            }
+            auto t_refine_tiles_end = Clock::now();
+            refine_tiles_ms += std::chrono::duration<double, std::milli>(
+                                   t_refine_tiles_end - t_refine_tiles_start).count();
         }
 
-        // (5) Metrics (optional)
-        if (metricsEnabled) {
-            auto t0 = Clock::now();
+        auto t_compute_end = Clock::now();
+        total_compute_ms += std::chrono::duration<double, std::milli>(
+                                t_compute_end - t_compute_start).count();
+
+        // Output
+        auto t_out_start = Clock::now();
+        if (args.outputEnabled) {
+            writer.write(finalRecon);
+        }
+        auto t_out_end = Clock::now();
+        total_output_ms += std::chrono::duration<double, std::milli>(
+                               t_out_end - t_out_start).count();
+
+        // Metrics
+        if (args.metricsEnabled) {
+            auto t_metrics_start = Clock::now();
             double mse  = computeMSE(frame, finalRecon);
             double ssim = computeSSIM(frame, finalRecon);
-            auto t1 = Clock::now();
-            metrics_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
-
-            totalMSE  += mse;
-            totalSSIM += ssim;
+            sumMSE  += mse;
+            sumSSIM += ssim;
+            metricFrames++;
+            auto t_metrics_end = Clock::now();
+            total_metrics_ms += std::chrono::duration<double, std::milli>(
+                                    t_metrics_end - t_metrics_start).count();
         }
 
-        frameCount++;
+        prevRecon       = finalRecon.clone();
+        prevSubsampled  = subsampled.clone();
 
-        // (6) Output (optional)
-        if (writeOutput) {
-            auto t0 = Clock::now();
-            writer.write(finalRecon);
-            auto t1 = Clock::now();
-            output_io_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
-        }
-
-        prevRecon      = finalRecon.clone();
-        prevSubsampled = subsampled.clone();
+        frameIndex++;
+        processedFrames++;
     }
 
-    auto endTotal = Clock::now();
-    double totalSec = std::chrono::duration<double>(endTotal - startTotal).count();
-    double total_ms = totalSec * 1000.0;
+    auto t_all_end = Clock::now();
+    double total_all_sec = std::chrono::duration<double>(
+                               t_all_end - t_all_start).count();
 
-    // Pipeline (no metrics)
-    double pipeline_ms = total_ms - metrics_ms;
-    if (pipeline_ms < 0) pipeline_ms = 0.0;
-    double pipelineSec = pipeline_ms / 1000.0;
+    double pipeline_ms = total_input_ms + total_output_ms + total_compute_ms;
+    double compute_ms  = total_compute_ms;
+    double metrics_ms  = total_metrics_ms;
 
-    // Compute = pipeline - input/output I/O
-    double compute_ms = pipeline_ms - input_io_ms - output_io_ms;
-    if (compute_ms < 0) compute_ms = 0.0;
-    double computeSec = compute_ms / 1000.0;
-
-    double avgMSE  = 0.0;
-    double avgSSIM = 0.0;
-    double psnr    = 0.0;
-
-    if (metricsEnabled && frameCount > 0) {
-        avgMSE  = totalMSE  / frameCount;
-        avgSSIM = totalSSIM / frameCount;
-        psnr    = mseToPSNR(avgMSE);
-    }
-
-    // ---------------------------------------
-    // High-level summary
-    // ---------------------------------------
     std::cout << "\n================= RESULTS =================\n";
-    std::cout << "Processed frames: " << frameCount << "\n";
-    std::cout << "Subsample factor: " << subsampleFactor << "\n";
+    std::cout << "Processed frames: " << processedFrames << "\n";
+    std::cout << "Subsample factor: " << args.subsampleFactor << "\n";
 
-#ifdef USE_CUDA_REFINEMENT
-    if (mode == MODE_BASELINE) {
-        std::cout << "Refinement backend: CPU baseline (1 thread, no CUDA)\n";
-    } else if (mode == MODE_OMP_ONLY) {
-        std::cout << "Refinement backend: CPU (OpenMP, no CUDA)\n";
+    std::cout << "Refinement backend: ";
+    if (args.mode == RunMode::CUDA) {
+        std::cout << "CUDA\n";
+    } else if (args.mode == RunMode::OMP_ONLY) {
+        std::cout << "CPU (OpenMP, no CUDA)\n";
     } else {
-        std::cout << "Refinement backend: "
-                  << (cuda_ok ? "CUDA\n" : "CPU (CUDA requested, fallback)\n");
+        std::cout << "CPU baseline (1 thread, no CUDA)\n";
     }
-#else
-    std::cout << "Refinement backend: CPU (OpenMP)\n";
-#endif
 
-    if (metricsEnabled) {
+    if (args.metricsEnabled && metricFrames > 0) {
+        double avgMSE  = sumMSE  / metricFrames;
+        double avgSSIM = sumSSIM / metricFrames;
+        double psnr    = mseToPSNR(avgMSE);
         std::cout << "Avg MSE:   " << avgMSE  << "\n";
         std::cout << "Avg SSIM:  " << avgSSIM << "\n";
-        std::cout << "Avg PSNR:  " << psnr    << " dB\n\n";
+        std::cout << "Avg PSNR:  " << psnr    << " dB\n";
     } else {
         std::cout << "Avg MSE:   N/A (metrics disabled)\n";
         std::cout << "Avg SSIM:  N/A (metrics disabled)\n";
-        std::cout << "Avg PSNR:  N/A (metrics disabled)\n\n";
+        std::cout << "Avg PSNR:  N/A (metrics disabled)\n";
     }
 
-    std::cout << "Total time (ALL, incl. metrics & I/O): "
-              << totalSec << " sec\n";
+    double total_pipeline_sec = pipeline_ms / 1000.0;
+    double total_compute_sec  = compute_ms  / 1000.0;
+    double total_metrics_sec  = metrics_ms  / 1000.0;
+
+    std::cout << "\nTotal time (ALL, incl. metrics & I/O): "
+              << total_all_sec << " sec\n";
     std::cout << "Pipeline (no metrics, but incl. I/O): "
-              << pipelineSec << " sec total, ";
-    if (frameCount > 0) {
-        std::cout << (pipeline_ms / frameCount) << " ms/frame\n";
+              << total_pipeline_sec << " sec total, ";
+    if (processedFrames > 0) {
+        std::cout << (pipeline_ms / processedFrames) << " ms/frame\n";
     } else {
         std::cout << "N/A ms/frame\n";
     }
 
     std::cout << "  - Input I/O (read frames): "
-              << (input_io_ms / 1000.0) << " sec total, ";
-    if (frameCount > 0) {
-        std::cout << (input_io_ms / frameCount) << " ms/frame\n";
+              << (total_input_ms / 1000.0) << " sec total, ";
+    if (processedFrames > 0) {
+        std::cout << (total_input_ms / processedFrames) << " ms/frame\n";
     } else {
         std::cout << "N/A ms/frame\n";
     }
 
     std::cout << "  - Output I/O (write frames): "
-              << (output_io_ms / 1000.0) << " sec total, ";
-    if (frameCount > 0) {
-        std::cout << (output_io_ms / frameCount) << " ms/frame\n";
+              << (total_output_ms / 1000.0) << " sec total, ";
+    if (processedFrames > 0) {
+        std::cout << (total_output_ms / processedFrames) << " ms/frame\n";
     } else {
         std::cout << "N/A ms/frame\n";
     }
 
     std::cout << "Compute-only (no metrics, no I/O): "
-              << computeSec << " sec total, ";
-    if (frameCount > 0) {
-        std::cout << (compute_ms / frameCount) << " ms/frame\n\n";
+              << total_compute_sec << " sec total, ";
+    if (processedFrames > 0) {
+        std::cout << (compute_ms / processedFrames) << " ms/frame\n";
     } else {
-        std::cout << "N/A ms/frame\n\n";
+        std::cout << "N/A ms/frame\n";
     }
-
-    if (metricsEnabled) {
-        std::cout << "Metrics time: "
-                  << (metrics_ms / 1000.0) << " sec total, ";
-        if (frameCount > 0) {
-            std::cout << (metrics_ms / frameCount) << " ms/frame\n\n";
-        } else {
-            std::cout << "N/A ms/frame\n\n";
-        }
-    } else {
-        std::cout << "Metrics time: 0 sec (metrics disabled)\n\n";
+    std::cout << "\nMetrics time: "
+              << total_metrics_sec << " sec";
+    if (processedFrames > 0) {
+        std::cout << " (" << (metrics_ms / processedFrames) << " ms/frame)";
     }
-
-    // ---------------------------------------
-    // Compute-stage breakdown (no metrics, no I/O)
-    // ---------------------------------------
-    auto print_compute_stage = [&](const char* name, double ms){
-        double avg = (frameCount > 0) ? (ms / frameCount) : 0.0;
-        double pct = (compute_ms > 0.0 ? (100.0 * ms / compute_ms) : 0.0);
-        std::cout << name << ": "
-                  << ms << " ms total, "
-                  << avg << " ms/frame, "
-                  << pct << "% of compute\n";
-    };
+    if (!args.metricsEnabled) {
+        std::cout << " (metrics disabled)";
+    }
+    std::cout << "\n\n";
 
     std::cout << "====== Compute breakdown (no metrics, no I/O) ======\n";
-    print_compute_stage("Subsample               ", subsample_ms);
-    print_compute_stage("Tile classify           ", classify_ms);
-    print_compute_stage("Reconstruction (full)   ", recon_full_ms);
-    print_compute_stage("Reconstruction (tiles)  ", recon_tiles_ms);
-    print_compute_stage("Refinement (full)       ", refine_full_ms);
-    print_compute_stage("Refinement (tiles)      ", refine_tiles_ms);
-    std::cout << "Total compute            : "
-              << compute_ms << " ms\n";
+    if (processedFrames > 0 && compute_ms > 0.0) {
+        auto pct = [&](double ms) {
+            return (ms / compute_ms) * 100.0;
+        };
+        auto perFrame = [&](double ms) {
+            return ms / processedFrames;
+        };
+
+        std::cout << "Subsample               : " << subsample_ms / 1000.0
+                  << " ms total, " << perFrame(subsample_ms)
+                  << " ms/frame, " << pct(subsample_ms) << "% of compute\n";
+        std::cout << "Tile classify           : " << classify_ms / 1000.0
+                  << " ms total, " << perFrame(classify_ms)
+                  << " ms/frame, " << pct(classify_ms) << "% of compute\n";
+        std::cout << "Reconstruction (full)   : " << recon_full_ms / 1000.0
+                  << " ms total, " << perFrame(recon_full_ms)
+                  << " ms/frame, " << pct(recon_full_ms) << "% of compute\n";
+        std::cout << "Reconstruction (tiles)  : " << recon_tiles_ms / 1000.0
+                  << " ms total, " << perFrame(recon_tiles_ms)
+                  << " ms/frame, " << pct(recon_tiles_ms) << "% of compute\n";
+        std::cout << "Refinement (full)       : " << refine_full_ms / 1000.0
+                  << " ms total, " << perFrame(refine_full_ms)
+                  << " ms/frame, " << pct(refine_full_ms) << "% of compute\n";
+        std::cout << "Refinement (tiles)      : " << refine_tiles_ms / 1000.0
+                  << " ms total, " << perFrame(refine_tiles_ms)
+                  << " ms/frame, " << pct(refine_tiles_ms) << "% of compute\n";
+        std::cout << "Total compute            : " << compute_ms / 1000.0 << " ms\n";
+    } else {
+        std::cout << "Not enough data to compute breakdown.\n";
+    }
     std::cout << "====================================================\n\n";
 
-    // ---------------------------------------
-    // Tile statistics
-    // ---------------------------------------
-    if (totalTiles > 0 && frameCount > 1) {
-        double avgActiveFrac  = static_cast<double>(totalActiveTiles) /
-                                static_cast<double>(totalTiles);
-        double avgActiveTiles = static_cast<double>(totalActiveTiles) /
-                                static_cast<double>(frameCount - 1); // frame 0 has no tiles
+    if (framesWithTiles > 0) {
+        double avgTilesPerFrame       = (double)totalTiles_sum / framesWithTiles;
+        double avgActiveTilesPerFrame = (double)totalActiveTiles_sum / framesWithTiles;
+        double avgActiveFraction      = (avgTilesPerFrame > 0.0)
+            ? (avgActiveTilesPerFrame / avgTilesPerFrame) * 100.0
+            : 0.0;
 
-        std::cout << "[Tile stats] total tiles (frames>0): " << totalTiles << "\n";
-        std::cout << "[Tile stats] total active tiles     : " << totalActiveTiles << "\n";
+        std::cout << "[Tile stats] total tiles (frames>0): "
+                  << totalTiles_sum << "\n";
+        std::cout << "[Tile stats] total active tiles     : "
+                  << totalActiveTiles_sum << "\n";
         std::cout << "[Tile stats] avg active fraction    : "
-                  << (avgActiveFrac * 100.0) << "%\n";
+                  << avgActiveFraction << "%\n";
         std::cout << "[Tile stats] avg active tiles/frame : "
-                  << avgActiveTiles << " (for frames 1..N-1)\n\n";
+                  << avgActiveTilesPerFrame
+                  << " (for frames 1..N-1)\n\n";
     }
 
 #ifdef USE_CUDA_REFINEMENT
     cudaPrintRefineStats();
+#else
+    std::cout << "[CUDA refine stats]\n";
+    std::cout << "  device          : none/unknown\n";
+    std::cout << "  refine calls    : 0 (full-frame)\n";
+    std::cout << "  refineTiles calls: 0 (tile-aware)\n";
+    std::cout << "  reconTiles calls: 0 (tile-aware)\n";
+    std::cout << "  total cudaMalloc: 0 ms\n";
+    std::cout << "  total cudaFree  : 0 ms\n";
+    std::cout << "  total H2D       : 0 ms\n";
+    std::cout << "  total kernel    : 0 ms\n";
+    std::cout << "  total D2H       : 0 ms\n";
+    std::cout << "--------------------------------------------------\n";
 #endif
 
     return 0;
