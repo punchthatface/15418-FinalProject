@@ -166,28 +166,33 @@ void iterativeRefine(cv::Mat& img,
 
     cv::Mat cur  = img.clone();
     cv::Mat next = img.clone();
-    #pragma omp parallel
-    {
-        #pragma omp for schedule(static) nowait
-        for (int it = 0; it < iterations; ++it) {
-            for (int y = 0; y < img.rows; ++y) {
-                for (int x = 0; x < img.cols; ++x) {
-                    if (mask.at<uint8_t>(y, x) == 1) {
-                        // Known pixels stay fixed – they “anchor” the solution
-                        next.at<cv::Vec3b>(y, x) = cur.at<cv::Vec3b>(y, x);
-                    } else {
-                        // Only refine missing pixels
-                        next.at<cv::Vec3b>(y, x) =
-                            average3x3MissingAware(cur, mask, y, x);
-                    }
+
+    int rows = img.rows;
+    int cols = img.cols;
+
+    for (int it = 0; it < iterations; ++it) {
+        // Parallelize over rows (safe), using cur as input, next as output
+        #pragma omp parallel for schedule(static)
+        for (int y = 0; y < rows; ++y) {
+            for (int x = 0; x < cols; ++x) {
+                if (mask.at<uint8_t>(y, x) == 1) {
+                    // Known pixels stay fixed – they “anchor” the solution
+                    next.at<cv::Vec3b>(y, x) = cur.at<cv::Vec3b>(y, x);
+                } else {
+                    // Only refine missing pixels
+                    next.at<cv::Vec3b>(y, x) =
+                        average3x3MissingAware(cur, mask, y, x);
                 }
             }
-            // Jacobi-style update: swap buffers
-            std::swap(cur, next);
         }
-        img = cur; // Final refined image
+
+        // Jacobi-style update: swap buffers (single-threaded)
+        std::swap(cur, next);
     }
+
+    img = cur; // Final refined image
 }
+
 
 void classifyTilesSADSubsample(const cv::Mat& currSubsampled,
                                const cv::Mat& prevSubsampled,
