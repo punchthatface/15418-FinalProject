@@ -109,6 +109,154 @@ __device__ inline int idx2d(int y, int x, int cols) {
     return y * cols + x;
 }
 
+// ============================================================================
+// CUDA classifyTilesSADSubsample
+// ============================================================================
+
+// Each thread handles exactly one tile (tx, ty).
+// We assume curr/prev are uchar3 arrays of size rows*cols, row-major.
+// tileActive is a tilesY x tilesX array of unsigned char (0 or 1).
+
+__global__
+void kernelClassifyTilesSADSubsample(const uchar3* curr,
+                                     const uchar3* prev,
+                                     unsigned char* tileActive,
+                                     int rows, int cols,
+                                     int tilesY, int tilesX,
+                                     int tileSize,
+                                     float sadThreshold)
+{
+    int tx = blockIdx.x;
+    int ty = blockIdx.y;
+
+    if (tx >= tilesX || ty >= tilesY) return;
+
+    int y0 = ty * tileSize;
+    int x0 = tx * tileSize;
+    int y1 = min(y0 + tileSize, rows);
+    int x1 = min(x0 + tileSize, cols);
+
+    double sad = 0.0;
+    int pixelCount = 0;
+
+    for (int y = y0; y < y1; ++y) {
+        for (int x = x0; x < x1; ++x) {
+            int idx = idx2d(y, x, cols);
+            uchar3 c = curr[idx];
+            uchar3 p = prev[idx];
+
+            sad += fabsf((float)c.x - (float)p.x);
+            sad += fabsf((float)c.y - (float)p.y);
+            sad += fabsf((float)c.z - (float)p.z);
+            pixelCount++;
+        }
+    }
+
+    float avgSAD = 0.0f;
+    if (pixelCount > 0) {
+        avgSAD = (float)(sad / (pixelCount * 3.0));
+    }
+
+    tileActive[ty * tilesX + tx] = (avgSAD > sadThreshold) ? 1 : 0;
+}
+
+// Host wrapper
+void classifyTilesSADSubsampleCUDA(const cv::Mat& currSubsampled,
+                                   const cv::Mat& prevSubsampled,
+                                   int tileSize,
+                                   double sadThreshold,
+                                   cv::Mat& tileActiveMask)
+{
+    // If no previous frame, match CPU behavior: mark all tiles active
+    if (prevSubsampled.empty()) {
+        int tilesY = (currSubsampled.rows + tileSize - 1) / tileSize;
+        int tilesX = (currSubsampled.cols + tileSize - 1) / tileSize;
+        tileActiveMask = cv::Mat::ones(tilesY, tilesX, CV_8UC1);
+        return;
+    }
+
+    CV_Assert(currSubsampled.size() == prevSubsampled.size());
+    CV_Assert(currSubsampled.type() == prevSubsampled.type());
+    CV_Assert(currSubsampled.type() == CV_8UC3);
+
+    int rows = currSubsampled.rows;
+    int cols = currSubsampled.cols;
+
+    int tilesY = (rows + tileSize - 1) / tileSize;
+    int tilesX = (cols + tileSize - 1) / tileSize;
+
+    tileActiveMask = cv::Mat::zeros(tilesY, tilesX, CV_8UC1);
+
+    // Host buffers: flatten to uchar3
+    std::vector<uchar3> h_curr(rows * cols);
+    std::vector<uchar3> h_prev(rows * cols);
+
+    for (int y = 0; y < rows; ++y) {
+        const cv::Vec3b* pc = currSubsampled.ptr<cv::Vec3b>(y);
+        const cv::Vec3b* pp = prevSubsampled.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < cols; ++x) {
+            int idx = y * cols + x;
+            cv::Vec3b c = pc[x];
+            cv::Vec3b p = pp[x];
+
+            h_curr[idx].x = c[0];
+            h_curr[idx].y = c[1];
+            h_curr[idx].z = c[2];
+
+            h_prev[idx].x = p[0];
+            h_prev[idx].y = p[1];
+            h_prev[idx].z = p[2];
+        }
+    }
+
+    std::vector<unsigned char> h_tiles(tilesY * tilesX, 0);
+
+    uchar3*        d_curr  = nullptr;
+    uchar3*        d_prev  = nullptr;
+    unsigned char* d_tiles = nullptr;
+
+    size_t pixelsBytes = rows * cols * sizeof(uchar3);
+    size_t tilesBytes  = tilesY * tilesX * sizeof(unsigned char);
+
+    // We do NOT touch the global refine/recon timers here, to keep those stats clean.
+    checkCuda(cudaMalloc(&d_curr,  pixelsBytes), "cudaMalloc d_curr (classify)");
+    checkCuda(cudaMalloc(&d_prev,  pixelsBytes), "cudaMalloc d_prev (classify)");
+    checkCuda(cudaMalloc(&d_tiles, tilesBytes),  "cudaMalloc d_tiles (classify)");
+
+    checkCuda(cudaMemcpy(d_curr, h_curr.data(), pixelsBytes, cudaMemcpyHostToDevice),
+              "cudaMemcpy H2D d_curr (classify)");
+    checkCuda(cudaMemcpy(d_prev, h_prev.data(), pixelsBytes, cudaMemcpyHostToDevice),
+              "cudaMemcpy H2D d_prev (classify)");
+
+    dim3 block(1, 1);
+    dim3 grid(tilesX, tilesY);
+
+    kernelClassifyTilesSADSubsample<<<grid, block>>>(
+        d_curr, d_prev, d_tiles,
+        rows, cols,
+        tilesY, tilesX,
+        tileSize,
+        static_cast<float>(sadThreshold)
+    );
+    checkCuda(cudaDeviceSynchronize(), "kernelClassifyTilesSADSubsample sync");
+
+    checkCuda(cudaMemcpy(h_tiles.data(), d_tiles, tilesBytes, cudaMemcpyDeviceToHost),
+              "cudaMemcpy D2H d_tiles (classify)");
+
+    cudaFree(d_curr);
+    cudaFree(d_prev);
+    cudaFree(d_tiles);
+
+    // Fill tileActiveMask from host buffer
+    for (int ty = 0; ty < tilesY; ++ty) {
+        unsigned char* rowPtr = tileActiveMask.ptr<unsigned char>(ty);
+        for (int tx = 0; tx < tilesX; ++tx) {
+            rowPtr[tx] = h_tiles[ty * tilesX + tx];
+        }
+    }
+}
+
+
 // -------------------- Kernels: refinement (existing) --------------------
 
 // Small 3x3 refinement kernel (full frame)

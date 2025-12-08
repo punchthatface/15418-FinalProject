@@ -22,7 +22,7 @@ using Clock = std::chrono::high_resolution_clock;
 enum class RunMode {
     BASELINE,   // OpenMP forced to 1 thread, no CUDA
     OMP_ONLY,   // OpenMP multi-thread, no CUDA
-    CUDA        // OpenMP + CUDA refinement / reconstruction
+    CUDA        // CPU + CUDA refinement / reconstruction
 };
 
 struct Args {
@@ -30,12 +30,15 @@ struct Args {
     std::string outputPath;
     int subsampleFactor = 2;
 
-    bool forceImages    = false;
-    bool outputEnabled  = true;
-    bool metricsEnabled = true;
+    bool forceImages     = false;
+    bool outputEnabled   = true;
+    bool metricsEnabled  = true;
 
-    RunMode mode = RunMode::CUDA;
+    RunMode mode         = RunMode::CUDA;
+    bool cudaClassify    = false;   // NEW: use CUDA for tile classification
 };
+
+// ----------------- Arg parsing -----------------
 
 static Args parseArgs(int argc, char** argv) {
     if (argc < 3) {
@@ -47,7 +50,8 @@ static Args parseArgs(int argc, char** argv) {
                   << "  --baseline        : baseline mode (1 thread, no CUDA)\n"
                   << "  --omp-only        : OpenMP-only mode (multi-thread, no CUDA)\n"
                   << "  (default, if CUDA compiled) : CUDA mode (CPU + CUDA refinement)\n"
-                  << "  --no-metrics      : disable MSE/SSIM/PSNR computation\n";
+                  << "  --no-metrics      : disable MSE/SSIM/PSNR computation\n"
+                  << "  --cuda-classify   : EXPERIMENTAL: run classifyTilesSADSubsample on CUDA\n";
         std::exit(1);
     }
 
@@ -72,6 +76,8 @@ static Args parseArgs(int argc, char** argv) {
             args.mode = RunMode::OMP_ONLY;
         } else if (a == "--no-metrics") {
             args.metricsEnabled = false;
+        } else if (a == "--cuda-classify") {
+            args.cudaClassify = true;
         }
     }
 
@@ -80,15 +86,17 @@ static Args parseArgs(int argc, char** argv) {
     }
 
 #ifndef USE_CUDA_REFINEMENT
+    // If we compiled without CUDA, force to OMP-only and ignore cudaClassify flag.
     if (args.mode == RunMode::CUDA) {
         args.mode = RunMode::OMP_ONLY;
     }
+    args.cudaClassify = false;
 #endif
 
     return args;
 }
 
-// --------- Image-sequence helpers ---------
+// ----------------- Image-sequence helpers -----------------
 
 static bool hasImageExtension(const std::string& name) {
     std::string lower = name;
@@ -120,6 +128,8 @@ static std::vector<std::string> listImagesInDir(const std::string& dir) {
     return files;
 }
 
+// ----------------- main -----------------
+
 int main(int argc, char** argv) {
     Args args = parseArgs(argc, argv);
 
@@ -142,7 +152,17 @@ int main(int argc, char** argv) {
         if (!cudaRefinementInit()) {
             std::cout << "[Init] CUDA not available, falling back to OMP-ONLY.\n";
             args.mode = RunMode::OMP_ONLY;
+            args.cudaClassify = false;
+        } else if (args.cudaClassify) {
+            std::cout << "[Init] EXPERIMENT: CUDA classification enabled.\n";
         }
+    } else {
+        args.cudaClassify = false;
+    }
+#else
+    if (args.cudaClassify) {
+        std::cout << "[Init] --cuda-classify ignored (no CUDA support in this build).\n";
+        args.cudaClassify = false;
     }
 #endif
 
@@ -303,14 +323,26 @@ int main(int argc, char** argv) {
             auto t_refine_full_end = Clock::now();
             refine_full_ms += std::chrono::duration<double, std::milli>(
                                   t_refine_full_end - t_refine_full_start).count();
-
         } else {
             // Subsequent frames: tile classify, tile reconstruction, tile refinement
             cv::Mat tileActive;
+
             auto t_classify_start = Clock::now();
-            classifyTilesSADSubsample(subsampled, prevSubsampled,
-                                      TILE_SIZE, SAD_THRESH,
-                                      tileActive);
+            if (args.mode == RunMode::CUDA && args.cudaClassify) {
+#ifdef USE_CUDA_REFINEMENT
+                classifyTilesSADSubsampleCUDA(subsampled, prevSubsampled,
+                                              TILE_SIZE, SAD_THRESH,
+                                              tileActive);
+#else
+                classifyTilesSADSubsample(subsampled, prevSubsampled,
+                                          TILE_SIZE, SAD_THRESH,
+                                          tileActive);
+#endif
+            } else {
+                classifyTilesSADSubsample(subsampled, prevSubsampled,
+                                          TILE_SIZE, SAD_THRESH,
+                                          tileActive);
+            }
             auto t_classify_end = Clock::now();
             classify_ms += std::chrono::duration<double, std::milli>(
                                t_classify_end - t_classify_start).count();
@@ -461,7 +493,9 @@ int main(int argc, char** argv) {
 
     std::cout << "Refinement backend: ";
     if (args.mode == RunMode::CUDA) {
-        std::cout << "CUDA\n";
+        std::cout << "CUDA";
+        if (args.cudaClassify) std::cout << " (with CUDA classify experiment)";
+        std::cout << "\n";
     } else if (args.mode == RunMode::OMP_ONLY) {
         std::cout << "CPU (OpenMP, no CUDA)\n";
     } else {
