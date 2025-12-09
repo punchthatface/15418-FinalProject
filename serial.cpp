@@ -35,12 +35,18 @@ struct Args {
     bool metricsEnabled = true;
 
     RunMode mode = RunMode::CUDA;
+
+    // NEW: runtime knobs
+    int    tileSize   = 2;
+    double sadThresh  = 1.0;
+    int    iterations = 3;
 };
 
 static Args parseArgs(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0]
-                  << " <input_video | image_dir> <output_video | -> [subsample_factor] [flags]\n"
+                  << " <input_video | image_dir> <output_video | ->"
+                  << " [subsample_factor] [tile_size] [sad_thresh] [iterations] [flags]\n"
                   << "Flags:\n"
                   << "  --force-images    : treat input as image-sequence directory\n"
                   << "  --no-output       : do not write output video\n"
@@ -55,12 +61,34 @@ static Args parseArgs(int argc, char** argv) {
     args.inputPath  = argv[1];
     args.outputPath = argv[2];
 
-    // Optional subsample factor if given and not a flag
-    if (argc >= 4 && argv[3][0] != '-') {
-        args.subsampleFactor = std::max(1, std::atoi(argv[3]));
+    int idx = 3;
+
+    // Optional subsample factor
+    if (idx < argc && argv[idx][0] != '-') {
+        args.subsampleFactor = std::max(1, std::atoi(argv[idx]));
+        idx++;
     }
 
-    for (int i = 3; i < argc; ++i) {
+    // Optional tile size
+    if (idx < argc && argv[idx][0] != '-') {
+        args.tileSize = std::max(1, std::atoi(argv[idx]));
+        idx++;
+    }
+
+    // Optional SAD threshold
+    if (idx < argc && argv[idx][0] != '-') {
+        args.sadThresh = std::atof(argv[idx]);
+        idx++;
+    }
+
+    // Optional iterations
+    if (idx < argc && argv[idx][0] != '-') {
+        args.iterations = std::max(1, std::atoi(argv[idx]));
+        idx++;
+    }
+
+    // Remaining args are flags
+    for (int i = idx; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--force-images") {
             args.forceImages = true;
@@ -123,10 +151,6 @@ static std::vector<std::string> listImagesInDir(const std::string& dir) {
 int main(int argc, char** argv) {
     Args args = parseArgs(argc, argv);
 
-    const int    TILE_SIZE   = 2;
-    const double SAD_THRESH  = 1.0;
-    const int    ITERATIONS  = 3;
-
     // Configure OpenMP threads according to mode
     if (args.mode == RunMode::BASELINE) {
         omp_set_num_threads(1);
@@ -136,6 +160,11 @@ int main(int argc, char** argv) {
     } else {
         std::cout << "[Init] Run mode: CUDA (CPU + CUDA refinement)\n";
     }
+
+    std::cout << "[Init] Subsample factor: " << args.subsampleFactor << "\n";
+    std::cout << "[Init] Tile size       : " << args.tileSize      << "\n";
+    std::cout << "[Init] SAD threshold   : " << args.sadThresh     << "\n";
+    std::cout << "[Init] Iterations      : " << args.iterations    << "\n";
 
 #ifdef USE_CUDA_REFINEMENT
     if (args.mode == RunMode::CUDA) {
@@ -293,12 +322,12 @@ int main(int argc, char** argv) {
             auto t_refine_full_start = Clock::now();
             if (args.mode == RunMode::CUDA) {
 #ifdef USE_CUDA_REFINEMENT
-                iterativeRefineCUDA(finalRecon, mask, ITERATIONS);
+                iterativeRefineCUDA(finalRecon, mask, args.iterations);
 #else
-                iterativeRefine(finalRecon, mask, ITERATIONS);
+                iterativeRefine(finalRecon, mask, args.iterations);
 #endif
             } else {
-                iterativeRefine(finalRecon, mask, ITERATIONS);
+                iterativeRefine(finalRecon, mask, args.iterations);
             }
             auto t_refine_full_end = Clock::now();
             refine_full_ms += std::chrono::duration<double, std::milli>(
@@ -309,7 +338,7 @@ int main(int argc, char** argv) {
             cv::Mat tileActive;
             auto t_classify_start = Clock::now();
             classifyTilesSADSubsample(subsampled, prevSubsampled,
-                                      TILE_SIZE, SAD_THRESH,
+                                      args.tileSize, args.sadThresh,
                                       tileActive);
             auto t_classify_end = Clock::now();
             classify_ms += std::chrono::duration<double, std::milli>(
@@ -338,7 +367,7 @@ int main(int argc, char** argv) {
                                      subsampled,
                                      mask,
                                      tileActive,
-                                     TILE_SIZE,
+                                     args.tileSize,
                                      args.subsampleFactor);
 #else
                 finalRecon = prevRecon.clone();
@@ -349,10 +378,10 @@ int main(int argc, char** argv) {
                     for (int tx = 0; tx < tilesX; ++tx) {
                         uint8_t active = tileActive.at<uint8_t>(ty, tx);
                         if (!active) continue;
-                        int y0 = ty * TILE_SIZE;
-                        int x0 = tx * TILE_SIZE;
-                        int y1 = std::min(y0 + TILE_SIZE, height);
-                        int x1 = std::min(x0 + TILE_SIZE, width);
+                        int y0 = ty * args.tileSize;
+                        int x0 = tx * args.tileSize;
+                        int y1 = std::min(y0 + args.tileSize, height);
+                        int x1 = std::min(x0 + args.tileSize, width);
                         for (int y = y0; y < y1; ++y) {
                             for (int x = x0; x < x1; ++x) {
                                 if (mask.at<uint8_t>(y, x) == 1) {
@@ -376,10 +405,10 @@ int main(int argc, char** argv) {
                     for (int tx = 0; tx < tilesX; ++tx) {
                         uint8_t active = tileActive.at<uint8_t>(ty, tx);
                         if (!active) continue;
-                        int y0 = ty * TILE_SIZE;
-                        int x0 = tx * TILE_SIZE;
-                        int y1 = std::min(y0 + TILE_SIZE, height);
-                        int x1 = std::min(x0 + TILE_SIZE, width);
+                        int y0 = ty * args.tileSize;
+                        int x0 = tx * args.tileSize;
+                        int y1 = std::min(y0 + args.tileSize, height);
+                        int x1 = std::min(x0 + args.tileSize, width);
                         for (int y = y0; y < y1; ++y) {
                             for (int x = x0; x < x1; ++x) {
                                 if (mask.at<uint8_t>(y, x) == 1) {
@@ -402,12 +431,15 @@ int main(int argc, char** argv) {
             auto t_refine_tiles_start = Clock::now();
             if (args.mode == RunMode::CUDA) {
 #ifdef USE_CUDA_REFINEMENT
-                iterativeRefineTilesCUDA(finalRecon, mask, tileActive, TILE_SIZE, ITERATIONS);
+                iterativeRefineTilesCUDA(finalRecon, mask, tileActive,
+                                         args.tileSize, args.iterations);
 #else
-                iterativeRefineTiles(finalRecon, mask, tileActive, TILE_SIZE, ITERATIONS);
+                iterativeRefineTiles(finalRecon, mask, tileActive,
+                                     args.tileSize, args.iterations);
 #endif
             } else {
-                iterativeRefineTiles(finalRecon, mask, tileActive, TILE_SIZE, ITERATIONS);
+                iterativeRefineTiles(finalRecon, mask, tileActive,
+                                     args.tileSize, args.iterations);
             }
             auto t_refine_tiles_end = Clock::now();
             refine_tiles_ms += std::chrono::duration<double, std::milli>(
@@ -458,6 +490,9 @@ int main(int argc, char** argv) {
     std::cout << "\n================= RESULTS =================\n";
     std::cout << "Processed frames: " << processedFrames << "\n";
     std::cout << "Subsample factor: " << args.subsampleFactor << "\n";
+    std::cout << "Tile size       : " << args.tileSize       << "\n";
+    std::cout << "SAD threshold   : " << args.sadThresh      << "\n";
+    std::cout << "Iterations      : " << args.iterations     << "\n";
 
     std::cout << "Refinement backend: ";
     if (args.mode == RunMode::CUDA) {
