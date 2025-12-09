@@ -15,8 +15,6 @@ This project builds a full **parallel video reconstruction system** that:
 - Parallelizes via **OpenMP** and **CUDA**
 - Produces detailed **metrics** for quality and performance
 
-Design motivation draws from our 15‑418 **Project Proposal** and progress documented in the **Milestone Report**.
-
 ## 2. Pipeline Architecture
 ### 2.1 Subsampling & Masking
 We retain 1 of N pixels (N = subsampleFactor²), creating a sparse frame + mask.
