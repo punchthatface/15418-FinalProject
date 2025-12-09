@@ -4,6 +4,8 @@
 
 > Reconstructing high-resolution video from aggressively subsampled frames using spatial interpolation, iterative refinement, and motion-aware selective computation. Pipeline implemented in C++ (serial + OpenMP) and CUDA, with detailed metrics (timing, tile activation, MSE/PSNR/SSIM).
 
+Website Link: https://martinlhw.github.io/PVR-via-MAPU/
+
 ## 1. Overview
 Modern video pipelines—mobile cameras, cloud gaming, streaming codecs—are increasingly **bandwidth-bound**. A common mitigation strategy is to **subsample** each frame and then use compute-heavy prediction to restore missing pixels.
 
