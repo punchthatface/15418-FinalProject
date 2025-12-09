@@ -1,22 +1,33 @@
-CXX := clang++
-CXXFLAGS := -std=c++17 -O2 -Xpreprocessor -fopenmp
-LDFLAGS := -lomp
+PKG_CONFIG  := pkg-config
+  
+OPENCV_CFLAGS := $(shell $(PKG_CONFIG) --cflags opencv)
+OPENCV_LIBS   := $(shell $(PKG_CONFIG) --libs   opencv)
 
-PKG_CONFIG := pkg-config
-OPENCV_CFLAGS := $(shell $(PKG_CONFIG) --cflags opencv4)
-OPENCV_LIBS := $(shell $(PKG_CONFIG) --libs opencv4)
+# NOTE: add -DUSE_CUDA_REFINEMENT here too
+CXXFLAGS   := -O3 -std=c++17 -fopenmp -DUSE_CUDA_REFINEMENT
+NVCCFLAGS  := -O3 -std=c++17 -DUSE_CUDA_REFINEMENT -Xcompiler -fopenmp
 
-LIBOMP_PREFIX := $(shell brew --prefix libomp)
+TARGET := serial
 
-all: serial
+CPU_SRCS   := serial.cpp recon.cpp metrics.cpp
+CPU_OBJS   := $(CPU_SRCS:.cpp=.o)
+CUDA_SRCS  := recon_cuda.cu
+CUDA_OBJS  := $(CUDA_SRCS:.cu=.o)
 
-serial: serial.cpp recon.cpp metrics.cpp
-	$(CXX) $(CXXFLAGS) \
-	    -I$(LIBOMP_PREFIX)/include \
-	    serial.cpp recon.cpp metrics.cpp \
-	    -o serial \
-	    -L$(LIBOMP_PREFIX)/lib $(LDFLAGS) \
-	    $(OPENCV_CFLAGS) $(OPENCV_LIBS)
+all: $(TARGET)
+
+$(TARGET): $(CPU_OBJS) $(CUDA_OBJS)
+        $(CXX) $(CXXFLAGS) \
+                $(CPU_OBJS) $(CUDA_OBJS) \
+                $(OPENCV_LIBS) \
+                -lcudart \
+                -o $(TARGET)
+
+%.o: %.cpp
+        $(CXX) $(CXXFLAGS) $(OPENCV_CFLAGS) -c $< -o $@
+
+%.o: %.cu
+        $(NVCC) $(NVCCFLAGS) $(OPENCV_CFLAGS) -c $< -o $@
 
 clean:
-	rm -f serial
+        rm -f $(TARGET) $(CPU_OBJS) $(CUDA_OBJS)

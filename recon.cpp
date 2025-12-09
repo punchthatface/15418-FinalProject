@@ -166,28 +166,33 @@ void iterativeRefine(cv::Mat& img,
 
     cv::Mat cur  = img.clone();
     cv::Mat next = img.clone();
-    #pragma omp parallel
-    {
-        #pragma omp for schedule(static) nowait
-        for (int it = 0; it < iterations; ++it) {
-            for (int y = 0; y < img.rows; ++y) {
-                for (int x = 0; x < img.cols; ++x) {
-                    if (mask.at<uint8_t>(y, x) == 1) {
-                        // Known pixels stay fixed – they “anchor” the solution
-                        next.at<cv::Vec3b>(y, x) = cur.at<cv::Vec3b>(y, x);
-                    } else {
-                        // Only refine missing pixels
-                        next.at<cv::Vec3b>(y, x) =
-                            average3x3MissingAware(cur, mask, y, x);
-                    }
+
+    int rows = img.rows;
+    int cols = img.cols;
+
+    for (int it = 0; it < iterations; ++it) {
+        // Parallelize over rows (safe), using cur as input, next as output
+        #pragma omp parallel for schedule(static)
+        for (int y = 0; y < rows; ++y) {
+            for (int x = 0; x < cols; ++x) {
+                if (mask.at<uint8_t>(y, x) == 1) {
+                    // Known pixels stay fixed – they “anchor” the solution
+                    next.at<cv::Vec3b>(y, x) = cur.at<cv::Vec3b>(y, x);
+                } else {
+                    // Only refine missing pixels
+                    next.at<cv::Vec3b>(y, x) =
+                        average3x3MissingAware(cur, mask, y, x);
                 }
             }
-            // Jacobi-style update: swap buffers
-            std::swap(cur, next);
         }
-        img = cur; // Final refined image
+
+        // Jacobi-style update: swap buffers (single-threaded)
+        std::swap(cur, next);
     }
+
+    img = cur; // Final refined image
 }
+
 
 void classifyTilesSADSubsample(const cv::Mat& currSubsampled,
                                const cv::Mat& prevSubsampled,
@@ -215,6 +220,8 @@ void classifyTilesSADSubsample(const cv::Mat& currSubsampled,
 
     tileActiveMask = cv::Mat::zeros(tilesY, tilesX, CV_8UC1);
 
+    // Parallelize over tiles (2D) – each (ty,tx) is independent
+    #pragma omp parallel for collapse(2) schedule(static)
     for (int ty = 0; ty < tilesY; ++ty) {
         for (int tx = 0; tx < tilesX; ++tx) {
             int y0 = ty * tileSize;
@@ -239,7 +246,9 @@ void classifyTilesSADSubsample(const cv::Mat& currSubsampled,
             }
 
             if (pixelCount == 0) {
-                tileActiveMask.at<uint8_t>(ty, tx) = 1; // edge case: treat as active
+                // Edge case: if the tile has no pixels (should be rare),
+                // treat it as active so we don't accidentally skip it.
+                tileActiveMask.at<uint8_t>(ty, tx) = 1;
                 continue;
             }
 
@@ -250,6 +259,8 @@ void classifyTilesSADSubsample(const cv::Mat& currSubsampled,
         }
     }
 }
+
+
 
 void iterativeRefineTiles(cv::Mat& img,
                           const cv::Mat& mask,
